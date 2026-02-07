@@ -1,0 +1,19 @@
+services:
+  db:
+    image: pgvector/pgvector:0.8.0-pg16-trixie
+    container_name: pgvector-db
+    environment:
+      POSTGRES_USER: raymolin
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: test
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/data/pgvector
+    deploy:
+      resources:
+        limits:
+          cpus: ${CPU:-2}
+          memory: ${MEMORY:-4G}
+volumes:
+  pgdata:
