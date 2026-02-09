@@ -13,7 +13,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: ${CPU:-2}
-          memory: ${MEMORY:-4G}
+          cpus: ${CPU:-4}
+          memory: ${MEMORY:-16G}
 volumes:
   pgdata:
