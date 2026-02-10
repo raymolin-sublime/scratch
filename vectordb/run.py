@@ -7,6 +7,7 @@ import argparse
 from commands import (
     register_generate_command,
     register_load_command,
+    register_plot_command,
     register_query_command,
 )
 
@@ -23,6 +24,7 @@ def main():
     # Register subcommands
     register_generate_command(subparsers)
     register_load_command(subparsers)
+    register_plot_command(subparsers)
     register_query_command(subparsers)
 
     # Parse and execute
