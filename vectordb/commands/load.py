@@ -44,15 +44,26 @@ def _snapshot_buffers(cur, table_name):
 
 def execute(args):
     """Execute the load command."""
+    # Validate --num-vectors
+    if args.num_vectors is not None and args.num_vectors <= 0:
+        print("Error: --num-vectors must be a positive integer")
+        return
+
     # Read HDF5 file
     print(f"Reading HDF5 file: {args.input}")
     with h5py.File(args.input, 'r') as f:
-        embeddings = f['embeddings'][:]
-        texts = f['texts'][:].astype(str)
-        num_vectors = f.attrs['num_vectors']
-        embedding_dim = f.attrs['embedding_dim']
+        total_vectors = int(f.attrs['num_vectors'])
+        embedding_dim = int(f.attrs['embedding_dim'])
 
-    print(f"Loaded {num_vectors} vectors with dimension {embedding_dim}")
+        num_vectors = min(args.num_vectors, total_vectors) if args.num_vectors is not None else total_vectors
+
+        embeddings = f['embeddings'][:num_vectors]
+        texts = f['texts'][:num_vectors].astype(str)
+
+    if args.num_vectors is not None and args.num_vectors > total_vectors:
+        print(f"Requested {args.num_vectors} vectors but file only contains {total_vectors}, loading all")
+
+    print(f"Loaded {num_vectors} vectors with dimension {embedding_dim} (file contains {total_vectors})")
 
     # Start docker stats polling thread
     db_samples = []
@@ -193,6 +204,12 @@ def register_load_command(subparsers):
         type=str,
         required=True,
         help='Input HDF5 file path'
+    )
+    parser.add_argument(
+        '-n', '--num-vectors',
+        type=int,
+        default=None,
+        help='Number of vectors to load from the HDF5 file (default: all)'
     )
     parser.add_argument(
         '--host',
