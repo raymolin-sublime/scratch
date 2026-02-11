@@ -29,17 +29,35 @@ def _poll_docker_stats(container, samples, stop_event):
         stop_event.wait(2)
 
 
+def _poll_shared_buffers(conninfo, table_name, samples, stop_event):
+    """Background thread that polls shared buffer usage every 2 seconds."""
+    try:
+        with psycopg.connect(conninfo) as conn:
+            with conn.cursor() as cur:
+                while not stop_event.is_set():
+                    try:
+                        snap = _snapshot_buffers(cur, table_name)
+                        snap['ts'] = time.monotonic()
+                        samples.append(snap)
+                    except Exception:
+                        pass
+                    stop_event.wait(2)
+    except Exception:
+        pass
+
+
 def _snapshot_buffers(cur, table_name):
     """Query pg_buffercache for buffers belonging to the given table."""
     cur.execute("""
         SELECT count(*) AS buffer_count,
+               count(*) * current_setting('block_size')::bigint AS total_bytes,
                pg_size_pretty(count(*) * current_setting('block_size')::bigint) AS total_size
         FROM pg_buffercache b
         JOIN pg_class c ON c.relfilenode = b.relfilenode
         WHERE c.relname = %s
     """, (table_name,))
     row = cur.fetchone()
-    return {'buffer_count': row[0], 'total_size': row[1]}
+    return {'buffer_count': row[0], 'total_bytes': row[1], 'total_size': row[2]}
 
 
 def execute(args):
@@ -75,13 +93,21 @@ def execute(args):
     )
     poll_thread.start()
 
+    # Start shared buffer polling thread
+    conninfo = f"host={args.host} port={args.port} dbname={args.database} user={args.user} password={args.password}"
+    buffer_samples = []
+    buffer_thread = threading.Thread(
+        target=_poll_shared_buffers,
+        args=(conninfo, args.table, buffer_samples, stop_event),
+        daemon=True,
+    )
+
     # Wait for at least one sample before proceeding
     deadline = time.monotonic() + 15
     while not db_samples and time.monotonic() < deadline:
         time.sleep(0.1)
 
     # Connect to PostgreSQL
-    conninfo = f"host={args.host} port={args.port} dbname={args.database} user={args.user} password={args.password}"
     print(f"Connecting to PostgreSQL at {args.host}:{args.port}/{args.database}")
 
     buffer_snapshots = {}
@@ -93,6 +119,23 @@ def execute(args):
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
             cur.execute("CREATE EXTENSION IF NOT EXISTS pg_buffercache")
             conn.commit()
+
+            # Set maintenance_work_mem if specified
+            if args.maintenance_work_mem:
+                print(f"Setting maintenance_work_mem = {args.maintenance_work_mem}")
+                cur.execute(psycopg.sql.SQL("SET maintenance_work_mem = {}").format(
+                    psycopg.sql.Literal(args.maintenance_work_mem)
+                ))
+                conn.commit()
+
+            # Query configured shared_buffers size in bytes
+            cur.execute("""
+                SELECT setting::bigint * current_setting('block_size')::bigint
+                FROM pg_settings WHERE name = 'shared_buffers'
+            """)
+            shared_buffers_total_bytes = cur.fetchone()[0]
+
+            buffer_thread.start()
 
             # Drop table if requested
             if args.drop_table:
@@ -152,17 +195,30 @@ def execute(args):
                 # Snapshot buffers after index creation
                 buffer_snapshots['after_index'] = _snapshot_buffers(cur, args.table)
 
-    # Stop docker stats polling
+            # Collect table and index sizes
+            cur.execute("""
+                SELECT pg_table_size(%s::regclass)::bigint,
+                       pg_indexes_size(%s::regclass)::bigint
+            """, (args.table, args.table))
+            table_size_bytes, index_size_bytes = cur.fetchone()
+
+    # Stop polling threads
     stop_event.set()
     poll_thread.join()
+    buffer_thread.join()
 
     # Build stats JSON
     stats = {
         'num_vectors': int(num_vectors),
         'embedding_dim': int(embedding_dim),
         'table': args.table,
+        'table_size_bytes': table_size_bytes,
+        'index_size_bytes': index_size_bytes,
         'buffer_snapshots': buffer_snapshots,
     }
+
+    if args.maintenance_work_mem:
+        stats['maintenance_work_mem'] = args.maintenance_work_mem
 
     if args.create_index:
         stats['index_creation_time_s'] = round(index_elapsed, 3)
@@ -180,6 +236,23 @@ def execute(args):
             'mem_pct': {
                 'avg': round(sum(mem_vals) / len(mem_vals), 2),
                 'max': round(max(mem_vals), 2),
+            },
+        }
+
+    if buffer_samples:
+        buf_bytes = [s['total_bytes'] for s in buffer_samples]
+        avg_bytes = round(sum(buf_bytes) / len(buf_bytes))
+        max_bytes = max(buf_bytes)
+        stats['shared_buffers'] = {
+            'configured_bytes': shared_buffers_total_bytes,
+            'samples': len(buffer_samples),
+            'bytes': {
+                'avg': avg_bytes,
+                'max': max_bytes,
+            },
+            'utilization_pct': {
+                'avg': round(avg_bytes / shared_buffers_total_bytes * 100, 2),
+                'max': round(max_bytes / shared_buffers_total_bytes * 100, 2),
             },
         }
 
@@ -267,6 +340,12 @@ def register_load_command(subparsers):
         type=str,
         default='pgvector-db',
         help='Docker container name for RAM polling (default: pgvector-db)'
+    )
+    parser.add_argument(
+        '--maintenance-work-mem',
+        type=str,
+        default=None,
+        help='Set maintenance_work_mem for index creation (e.g. 1GB, 512MB)'
     )
     parser.add_argument(
         '--stats-file',

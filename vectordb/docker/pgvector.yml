@@ -6,6 +6,8 @@ services:
       POSTGRES_USER: raymolin
       POSTGRES_PASSWORD: secret
       POSTGRES_DB: test
+    command: postgres -c 'shared_buffers=2GB'
+    shm_size: 4g
     ports:
       - "5432:5432"
     volumes:
