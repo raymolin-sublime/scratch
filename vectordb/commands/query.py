@@ -1,4 +1,5 @@
 """Query command for load-testing nearest neighbor queries with monitoring."""
+import argparse
 import json
 import math
 import random
@@ -7,6 +8,19 @@ import string
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import List, NamedTuple
+
+SubParsersAction = argparse._SubParsersAction[argparse.ArgumentParser]  # type: ignore[type-arg]
+
+
+class QueryRow(NamedTuple):
+    id: int
+    text: str
+    distance: float
+
+class QueryResult(NamedTuple):
+    latency: float
+    rows: List[QueryRow]
 
 import psycopg
 from sentence_transformers import SentenceTransformer
@@ -17,14 +31,14 @@ from .common import (
 )
 
 
-def generate_random_text(min_length=100, max_length=500):
+def generate_random_text(min_length: int = 100, max_length: int = 500) -> str:
     """Generate random ASCII text of specified length range."""
     length = random.randint(min_length, max_length)
     chars = string.ascii_letters + string.digits + string.punctuation + ' ' * 10
     return ''.join(random.choice(chars) for _ in range(length))
 
 
-def _parse_period(period_str):
+def _parse_period(period_str: str) -> int:
     """Parse a period string like '5m', '30s', '2h' to seconds."""
     match = re.fullmatch(r'(\d+)([smh])', period_str)
     if not match:
@@ -33,7 +47,7 @@ def _parse_period(period_str):
     return value * {'s': 1, 'm': 60, 'h': 3600}[unit]
 
 
-def _latency_stats(latencies):
+def _latency_stats(latencies: list[float]) -> dict[str, float]:
     """Compute latency percentile statistics."""
     sorted_lat = sorted(latencies)
     n = len(sorted_lat)
@@ -49,10 +63,12 @@ def _latency_stats(latencies):
 _thread_local = threading.local()
 
 
-def _run_single_query(conninfo, table, neighbors, vector_str):
-    """Run a single nearest-neighbor query. Returns latency in seconds."""
+def _run_single_query(conninfo: str, table: str, neighbors: int, vector_str: str, timeout_ms: float) -> QueryResult:
+    """Run a single nearest-neighbor query. Returns (latency, rows)."""
     if not hasattr(_thread_local, 'conn') or _thread_local.conn.closed:
         _thread_local.conn = psycopg.connect(conninfo, autocommit=True)
+        with _thread_local.conn.cursor() as cur:
+            cur.execute(f"SET statement_timeout = {int(timeout_ms)}")
     conn = _thread_local.conn
 
     t0 = time.perf_counter()
@@ -63,11 +79,12 @@ def _run_single_query(conninfo, table, neighbors, vector_str):
             ORDER BY embedding <=> %s::vector
             LIMIT %s
         """, (vector_str, vector_str, neighbors))
-        cur.fetchall()
-    return time.perf_counter() - t0
+        rows = [QueryRow(*r) for r in cur.fetchall()]
+    latency = time.perf_counter() - t0
+    return QueryResult(latency, rows)
 
 
-def execute(args):
+def execute(args: argparse.Namespace):
     """Execute the query command."""
     if args.seed is not None:
         random.seed(args.seed)
@@ -78,7 +95,7 @@ def execute(args):
     conninfo = build_conninfo(args)
 
     # Pre-generate query embeddings
-    pool_size = min(total_queries, 100)
+    pool_size = min(total_queries, 50000)
     print(f"Loading BGE model and pre-generating {pool_size} query embedding(s)...")
     model = SentenceTransformer('BAAI/bge-large-en-v1.5')
 
@@ -116,9 +133,10 @@ def execute(args):
         time.sleep(0.1)
 
     # Run queries at target QPS
-    print(f"Running {args.qps} QPS for {args.period} ({duration_s}s)...")
-    query_results = []  # [(relative_submit_time, latency), ...]
-    errors = 0
+    timeout_ms = args.timeout * 1000
+    print(f"Running {args.qps} QPS for {args.period} ({duration_s}s), timeout={args.timeout}s...")
+    query_results = []  # [(relative_submit_time, latency, rows), ...]
+    error_times = []  # [relative_submit_time, ...]
     max_workers = max(args.qps * 2, 4)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -135,16 +153,17 @@ def execute(args):
             vec = vector_strs[query_num % len(vector_strs)]
             rel_time = time.monotonic() - start
             futures.append((rel_time, pool.submit(
-                _run_single_query, conninfo, args.table, args.neighbors, vec
+                _run_single_query, conninfo, args.table, args.neighbors, vec, timeout_ms
             )))
             query_num += 1
 
         # Collect results
         for rel_time, f in futures:
             try:
-                query_results.append((rel_time, f.result(timeout=30)))
+                result = f.result(timeout=30)
+                query_results.append((rel_time, result.latency, result.rows))
             except Exception:
-                errors += 1
+                error_times.append(rel_time)
 
     elapsed = time.monotonic() - start
 
@@ -154,7 +173,8 @@ def execute(args):
     buffer_thread.join()
 
     # Aggregate stats
-    latencies = [lat for _, lat in query_results]
+    latencies = [lat for _, lat, _ in query_results]
+    errors = len(error_times)
     stats = {
         'qps_target': args.qps,
         'qps_actual': round(len(latencies) / elapsed, 2) if elapsed > 0 else 0,
@@ -191,7 +211,7 @@ def execute(args):
             }
 
             # Query latencies in this window
-            w_lats = [lat for t, lat in query_results if w_start <= t < w_end]
+            w_lats = [lat for t, lat, _ in query_results if w_start <= t < w_end]
             w['queries'] = len(w_lats)
             if w_lats:
                 actual_duration = min(w_end, elapsed) - w_start
@@ -233,7 +253,7 @@ def execute(args):
             write_stats(stats, args.stats_file)
 
 
-def register_query_command(subparsers):
+def register_query_command(subparsers: SubParsersAction) -> None:
     """Register the query subcommand."""
     parser = subparsers.add_parser(
         'query',
@@ -270,6 +290,12 @@ def register_query_command(subparsers):
         type=str,
         default=None,
         help='Query text (default: generate random text per query)'
+    )
+    parser.add_argument(
+        '--timeout',
+        type=float,
+        default=1.0,
+        help='Query statement timeout in seconds (default: 1)'
     )
     parser.add_argument(
         '--seed',
