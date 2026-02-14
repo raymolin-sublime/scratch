@@ -102,9 +102,9 @@ def _run_single_query(
         # <#> is negative dot product; smaller values are more similar
         cur.execute(
             f"""
-            SELECT id, text, embedding <#> %s::vector AS distance
+            SELECT id, text, embedding <=> %s::vector AS distance
             FROM {table}
-            ORDER BY embedding <#> %s::vector
+            ORDER BY embedding <=> %s::vector
             LIMIT %s
         """,
             (vector_str, vector_str, neighbors),
@@ -264,7 +264,7 @@ def execute(args: argparse.Namespace):
     conninfo = build_conninfo(args)
 
     # Pre-generate query embeddings
-    pool_size = min(total_queries, 50000)
+    pool_size = min(total_queries, 10000)
     input_dataset = _synthesize_dataset(pool_size)
 
     # Compute ground truth if reference dataset provided

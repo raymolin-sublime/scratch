@@ -20,10 +20,14 @@ def execute(args):
     """Execute the plot command."""
     import matplotlib.pyplot as plt
 
-    files = sorted(glob.glob(os.path.join(args.directory, '**', '*.json'), recursive=True))
-    if not files:
-        print(f"No .json files found in {args.directory}")
-        return
+    files = []
+    if args.file:
+        files = [args.file]
+    elif args.directory:
+        files = sorted(glob.glob(os.path.join(args.directory, '**', '*.json'), recursive=True))
+        if not files:
+            print(f"No .json files found in {args.directory}")
+            return
 
     # Parse all JSONL records
     records = []
@@ -140,11 +144,16 @@ def register_plot_command(subparsers):
         'plot',
         help='Plot benchmark results from JSONL files'
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         '-d', '--directory',
         type=str,
-        required=True,
-        help='Path to the results directory containing .json files'
+        help='Path to a results directory containing .json files'
+    )
+    source.add_argument(
+        '-f', '--file',
+        type=str,
+        help='Path to a single JSONL file'
     )
     parser.add_argument(
         '-o', '--output',

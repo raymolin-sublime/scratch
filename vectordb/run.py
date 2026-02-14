@@ -2,6 +2,7 @@
 """
 Vector embedding CLI tool with generate, load, and query functionality.
 """
+
 import argparse
 
 from commands import (
@@ -14,11 +15,11 @@ from commands import (
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Vector embedding CLI tool',
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        description="Vector embedding CLI tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
     subparsers.required = True
 
     # Register subcommands
@@ -32,5 +33,5 @@ def main():
     args.func(args)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

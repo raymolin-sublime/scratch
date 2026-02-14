@@ -1,16 +1,39 @@
 """Load command for importing embeddings into PostgreSQL."""
+
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 
 import h5py
+import numpy as np
 import psycopg
 
 from .common import (
-    add_common_args, build_conninfo, poll_docker_stats, poll_shared_buffers,
-    snapshot_buffers, summarize_stats, write_stats,
+    add_common_args,
+    build_conninfo,
+    poll_docker_stats,
+    poll_shared_buffers,
+    snapshot_buffers,
+    summarize_stats,
+    write_stats,
 )
+
+
+def _format_chunk(texts_chunk, embeddings_chunk):
+    """Format a chunk of texts and embeddings into tab-delimited COPY format."""
+    buf = StringIO()
+    for text, embedding in zip(texts_chunk, embeddings_chunk):
+        text_escaped = (
+            text.replace("\\", "\\\\")
+            .replace("\t", "\\t")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+        )
+        vector_str = "[" + ",".join(map(str, embedding)) + "]"
+        buf.write(f"{text_escaped}\t{vector_str}\n")
+    return buf.getvalue()
 
 
 def execute(args):
@@ -22,19 +45,27 @@ def execute(args):
 
     # Read HDF5 file
     print(f"Reading HDF5 file: {args.input}")
-    with h5py.File(args.input, 'r') as f:
-        total_vectors = int(f.attrs['num_vectors'])
-        embedding_dim = int(f.attrs['embedding_dim'])
+    with h5py.File(args.input, "r") as f:
+        total_vectors = int(f.attrs["num_vectors"])
+        embedding_dim = int(f.attrs["embedding_dim"])
 
-        num_vectors = min(args.num_vectors, total_vectors) if args.num_vectors is not None else total_vectors
+        num_vectors = (
+            min(args.num_vectors, total_vectors)
+            if args.num_vectors is not None
+            else total_vectors
+        )
 
-        embeddings = f['embeddings'][:num_vectors]
-        texts = f['texts'][:num_vectors].astype(str)
+        embeddings = f["embeddings"][:num_vectors]
+        texts = f["texts"][:num_vectors].astype(str)
 
     if args.num_vectors is not None and args.num_vectors > total_vectors:
-        print(f"Requested {args.num_vectors} vectors but file only contains {total_vectors}, loading all")
+        print(
+            f"Requested {args.num_vectors} vectors but file only contains {total_vectors}, loading all"
+        )
 
-    print(f"Loaded {num_vectors} vectors with dimension {embedding_dim} (file contains {total_vectors})")
+    print(
+        f"Loaded {num_vectors} vectors with dimension {embedding_dim} (file contains {total_vectors})"
+    )
 
     # Start docker stats polling thread
     db_samples = []
@@ -76,9 +107,11 @@ def execute(args):
             # Set maintenance_work_mem if specified
             if args.maintenance_work_mem:
                 print(f"Setting maintenance_work_mem = {args.maintenance_work_mem}")
-                cur.execute(psycopg.sql.SQL("SET maintenance_work_mem = {}").format(
-                    psycopg.sql.Literal(args.maintenance_work_mem)
-                ))
+                cur.execute(
+                    psycopg.sql.SQL("SET maintenance_work_mem = {}").format(
+                        psycopg.sql.Literal(args.maintenance_work_mem)
+                    )
+                )
                 conn.commit()
 
             buffer_thread.start()
@@ -102,18 +135,22 @@ def execute(args):
                 conn.commit()
 
             # Snapshot buffers before load
-            buffer_snapshots['before_load'] = snapshot_buffers(cur, args.table)
+            buffer_snapshots["before_load"] = snapshot_buffers(cur, args.table)
 
-            # Prepare data for COPY
+            # Prepare data for COPY (parallel)
             print(f"Preparing data for COPY...")
-            buffer = StringIO()
-            for text, embedding in zip(texts, embeddings):
-                # Escape text for tab-delimited format
-                text_escaped = text.replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
-                # Format vector as [1,2,3,...]
-                vector_str = '[' + ','.join(map(str, embedding)) + ']'
-                buffer.write(f"{text_escaped}\t{vector_str}\n")
+            num_chunks = 4
+            text_chunks = np.array_split(texts, num_chunks)
+            embedding_chunks = np.array_split(embeddings, num_chunks)
 
+            with ThreadPoolExecutor(max_workers=num_chunks) as pool:
+                chunk_results = list(
+                    pool.map(_format_chunk, text_chunks, embedding_chunks)
+                )
+
+            buffer = StringIO()
+            for chunk in chunk_results:
+                buffer.write(chunk)
             buffer.seek(0)
 
             # Use COPY to bulk insert
@@ -124,7 +161,7 @@ def execute(args):
             conn.commit()
 
             # Snapshot buffers after load
-            buffer_snapshots['after_load'] = snapshot_buffers(cur, args.table)
+            buffer_snapshots["after_load"] = snapshot_buffers(cur, args.table)
 
             # Create index if requested
             if args.create_index:
@@ -139,13 +176,16 @@ def execute(args):
                 print(f"Index creation time: {index_elapsed:.2f}s")
 
                 # Snapshot buffers after index creation
-                buffer_snapshots['after_index'] = snapshot_buffers(cur, args.table)
+                buffer_snapshots["after_index"] = snapshot_buffers(cur, args.table)
 
             # Collect table and index sizes
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT pg_table_size(%s::regclass)::bigint,
                        pg_indexes_size(%s::regclass)::bigint
-            """, (args.table, args.table))
+            """,
+                (args.table, args.table),
+            )
             table_size_bytes, index_size_bytes = cur.fetchone()
 
     # Stop polling threads
@@ -155,19 +195,19 @@ def execute(args):
 
     # Build stats JSON
     stats = {
-        'num_vectors': int(num_vectors),
-        'embedding_dim': int(embedding_dim),
-        'table': args.table,
-        'table_size_bytes': table_size_bytes,
-        'index_size_bytes': index_size_bytes,
-        'buffer_snapshots': buffer_snapshots,
+        "num_vectors": int(num_vectors),
+        "embedding_dim": int(embedding_dim),
+        "table": args.table,
+        "table_size_bytes": table_size_bytes,
+        "index_size_bytes": index_size_bytes,
+        "buffer_snapshots": buffer_snapshots,
     }
 
     if args.maintenance_work_mem:
-        stats['maintenance_work_mem'] = args.maintenance_work_mem
+        stats["maintenance_work_mem"] = args.maintenance_work_mem
 
     if args.create_index:
-        stats['index_creation_time_s'] = round(index_elapsed, 3)
+        stats["index_creation_time_s"] = round(index_elapsed, 3)
 
     stats.update(summarize_stats(db_samples, buffer_samples, args.container, conninfo))
 
@@ -181,42 +221,35 @@ def execute(args):
 def register_load_command(subparsers):
     """Register the load subcommand."""
     parser = subparsers.add_parser(
-        'load',
-        help='Load embeddings from HDF5 into PostgreSQL'
+        "load", help="Load embeddings from HDF5 into PostgreSQL"
     )
     add_common_args(parser)
 
     parser.add_argument(
-        '-i', '--input',
-        type=str,
-        required=True,
-        help='Input HDF5 file path'
+        "-i", "--input", type=str, required=True, help="Input HDF5 file path"
     )
     parser.add_argument(
-        '-n', '--num-vectors',
+        "-n",
+        "--num-vectors",
         type=int,
         default=None,
-        help='Number of vectors to load from the HDF5 file (default: all)'
+        help="Number of vectors to load from the HDF5 file (default: all)",
     )
     parser.add_argument(
-        '--create-table',
-        action='store_true',
-        help='Create table if it does not exist'
+        "--create-table", action="store_true", help="Create table if it does not exist"
     )
     parser.add_argument(
-        '--drop-table',
-        action='store_true',
-        help='Drop table if it exists before creating'
+        "--drop-table",
+        action="store_true",
+        help="Drop table if it exists before creating",
     )
     parser.add_argument(
-        '--create-index',
-        action='store_true',
-        help='Create HNSW index after loading'
+        "--create-index", action="store_true", help="Create HNSW index after loading"
     )
     parser.add_argument(
-        '--maintenance-work-mem',
+        "--maintenance-work-mem",
         type=str,
         default=None,
-        help='Set maintenance_work_mem for index creation (e.g. 1GB, 512MB)'
+        help="Set maintenance_work_mem for index creation (e.g. 1GB, 512MB)",
     )
     parser.set_defaults(func=execute)
