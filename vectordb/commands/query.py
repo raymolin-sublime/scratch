@@ -1,4 +1,7 @@
 """Query command for load-testing nearest neighbor queries with monitoring."""
+
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -8,9 +11,30 @@ import string
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, NamedTuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
-SubParsersAction = argparse._SubParsersAction[argparse.ArgumentParser]  # type: ignore[type-arg]
+import numpy as np
+import psycopg
+from numpy.typing import NDArray
+from sentence_transformers import SentenceTransformer
+
+from .common import (
+    add_common_args,
+    build_conninfo,
+    poll_docker_stats,
+    poll_shared_buffers,
+    summarize_stats,
+    write_stats,
+)
+
+if TYPE_CHECKING:
+    SubParsersAction = argparse._SubParsersAction[argparse.ArgumentParser]  # type: ignore[type-arg]
+
+
+class Embedding(NamedTuple):
+    text: str
+    vector: str
+    raw: NDArray[np.float32]
 
 
 class QueryRow(NamedTuple):
@@ -18,70 +42,215 @@ class QueryRow(NamedTuple):
     text: str
     distance: float
 
+
 class QueryResult(NamedTuple):
     latency: float
     rows: List[QueryRow]
-
-import psycopg
-from sentence_transformers import SentenceTransformer
-
-from .common import (
-    add_common_args, build_conninfo, poll_docker_stats, poll_shared_buffers,
-    summarize_stats, write_stats,
-)
+    recall: Optional[float] = None
 
 
-def generate_random_text(min_length: int = 100, max_length: int = 500) -> str:
-    """Generate random ASCII text of specified length range."""
-    length = random.randint(min_length, max_length)
-    chars = string.ascii_letters + string.digits + string.punctuation + ' ' * 10
-    return ''.join(random.choice(chars) for _ in range(length))
-
-
-def _parse_period(period_str: str) -> int:
-    """Parse a period string like '5m', '30s', '2h' to seconds."""
-    match = re.fullmatch(r'(\d+)([smh])', period_str)
-    if not match:
-        raise ValueError(f"Invalid period format: {period_str}. Use e.g. '30s', '5m', '2h'")
-    value, unit = int(match.group(1)), match.group(2)
-    return value * {'s': 1, 'm': 60, 'h': 3600}[unit]
-
-
-def _latency_stats(latencies: list[float]) -> dict[str, float]:
-    """Compute latency percentile statistics."""
-    sorted_lat = sorted(latencies)
-    n = len(sorted_lat)
-    return {
-        'avg': round(sum(sorted_lat) / n, 4),
-        'p50': round(sorted_lat[n // 2], 4),
-        'p95': round(sorted_lat[min(int(n * 0.95), n - 1)], 4),
-        'p99': round(sorted_lat[min(int(n * 0.99), n - 1)], 4),
-        'max': round(sorted_lat[-1], 4),
-    }
+class WindowResult(NamedTuple):
+    window: float
+    result: QueryResult
 
 
 _thread_local = threading.local()
 
 
-def _run_single_query(conninfo: str, table: str, neighbors: int, vector_str: str, timeout_ms: float) -> QueryResult:
-    """Run a single nearest-neighbor query. Returns (latency, rows)."""
-    if not hasattr(_thread_local, 'conn') or _thread_local.conn.closed:
+def _parse_period(period_str: str) -> int:
+    """Parse a period string like '5m', '30s', '2h' to seconds."""
+    match = re.fullmatch(r"(\d+)([smh])", period_str)
+    if not match:
+        raise ValueError(
+            f"Invalid period format: {period_str}. Use e.g. '30s', '5m', '2h'"
+        )
+    value, unit = int(match.group(1)), match.group(2)
+    return value * {"s": 1, "m": 60, "h": 3600}[unit]
+
+
+def _latency_mstats(latencies: list[float]) -> dict[str, float]:
+    """Compute latency percentile statistics."""
+    sorted_lat = sorted(latencies)
+    n = len(sorted_lat)
+    return {
+        "avg": round(sum(sorted_lat) / n, 4),
+        "p50": round(sorted_lat[n // 2], 4),
+        "p95": round(sorted_lat[min(int(n * 0.95), n - 1)], 4),
+        "p99": round(sorted_lat[min(int(n * 0.99), n - 1)], 4),
+        "max": round(sorted_lat[-1], 4),
+    }
+
+
+def _run_single_query(
+    conninfo: str,
+    table: str,
+    neighbors: int,
+    vector_str: str,
+    timeout_ms: float,
+    expected_neighbors: Optional[List[str]] = None,
+) -> QueryResult:
+    """Run a single nearest-neighbor query. Returns (latency, rows, recall)."""
+    if not hasattr(_thread_local, "conn") or _thread_local.conn.closed:
         _thread_local.conn = psycopg.connect(conninfo, autocommit=True)
-        with _thread_local.conn.cursor() as cur:
-            cur.execute(f"SET statement_timeout = {int(timeout_ms)}")
+        if timeout_ms:
+            with _thread_local.conn.cursor() as cur:
+                cur.execute(f"SET statement_timeout = {int(timeout_ms)}")
     conn = _thread_local.conn
 
     t0 = time.perf_counter()
     with conn.cursor() as cur:
-        cur.execute(f"""
-            SELECT id, text, embedding <=> %s::vector AS distance
+        # <#> is negative dot product; smaller values are more similar
+        cur.execute(
+            f"""
+            SELECT id, text, embedding <#> %s::vector AS distance
             FROM {table}
-            ORDER BY embedding <=> %s::vector
+            ORDER BY embedding <#> %s::vector
             LIMIT %s
-        """, (vector_str, vector_str, neighbors))
+        """,
+            (vector_str, vector_str, neighbors),
+        )
         rows = [QueryRow(*r) for r in cur.fetchall()]
-    latency = time.perf_counter() - t0
-    return QueryResult(latency, rows)
+    latency_ms = (time.perf_counter() - t0) * 1000
+
+    recall = None
+    if expected_neighbors is not None and expected_neighbors:
+        result_texts = {r.text for r in rows}
+        truth_texts = set(expected_neighbors)
+        recall = len(result_texts & truth_texts) / len(truth_texts)
+
+    return QueryResult(latency_ms, rows, recall)
+
+
+def _generate_random_text(min_length: int = 100, max_length: int = 500) -> str:
+    """Generate random ASCII text of specified length range."""
+    length = random.randint(min_length, max_length)
+    chars = string.ascii_letters + string.digits + string.punctuation + " " * 10
+    return "".join(random.choice(chars) for _ in range(length))
+
+
+def _synthesize_dataset(size: int) -> List[Embedding]:
+    print(f"Loading BGE model and pre-generating {size} query embedding(s)...")
+    model = SentenceTransformer("BAAI/bge-large-en-v1.5")
+    texts = [_generate_random_text() for _ in range(size)]
+
+    embeddings = model.encode(texts, convert_to_numpy=True, batch_size=32)
+    vectors = ["[" + ",".join(map(str, emb)) + "]" for emb in embeddings]
+
+    return [
+        Embedding(text, vector, emb)
+        for text, vector, emb in zip(texts, vectors, embeddings)
+    ]
+
+
+def _generate_stats(
+    args: argparse.Namespace,
+    results: List[WindowResult],
+    db_samples: List,
+    buffer_samples: List,
+    conn_info: str,
+    error_times: List[float],
+    window_s: Optional[int],
+    elapsed: float,
+) -> List[dict]:
+    latencies = [r.result.latency for r in results]
+    errors = len(error_times)
+    stats = {
+        "qps_target": args.qps,
+        "qps_actual": round(len(latencies) / elapsed, 2) if elapsed > 0 else 0,
+        "period": args.period,
+        "duration_s": round(elapsed, 2),
+        "total_queries": len(latencies),
+        "errors": errors,
+        "neighbors": args.neighbors,
+        "table": args.table,
+    }
+
+    if latencies:
+        stats["latency_ms"] = _latency_mstats(latencies)
+
+    recalls = [r.result.recall for r in results if r.result.recall is not None]
+    if recalls:
+        stats["recall_avg"] = round(sum(recalls) / len(recalls), 4)
+
+    stats.update(summarize_stats(db_samples, buffer_samples, args.container, conn_info))
+
+    if window_s:
+        output = []
+        num_windows = math.ceil(elapsed / window_s)
+        configured_bytes = stats.get("shared_buffers", {}).get("configured_bytes")
+
+        for i in range(num_windows):
+            w_start = i * window_s
+            w_end = (i + 1) * window_s
+            w = {
+                "window": i,
+                "window_s": window_s,
+                "start_s": round(w_start, 2),
+                "end_s": round(min(w_end, elapsed), 2),
+                "qps_target": args.qps,
+                "period": args.period,
+                "duration_s": round(elapsed, 2),
+                "neighbors": args.neighbors,
+                "table": args.table,
+            }
+
+            # Query latencies in this window
+            w_lats = [r.result.latency for r in results if w_start <= r.window < w_end]
+            w["queries"] = len(w_lats)
+            if w_lats:
+                actual_duration = min(w_end, elapsed) - w_start
+                w["qps_actual"] = (
+                    round(len(w_lats) / actual_duration, 2)
+                    if actual_duration > 0
+                    else 0
+                )
+                w["latency_ms"] = _latency_mstats(w_lats)
+
+            # Recall in this window
+            w_recalls = [
+                r.result.recall
+                for r in results
+                if w_start <= r.window < w_end and r.result.recall is not None
+            ]
+            if w_recalls:
+                w["recall_avg"] = round(sum(w_recalls) / len(w_recalls), 4)
+
+            # Docker stats in this window
+            w_db = [s for s in db_samples if w_start <= s["ts"] < w_end]
+            if w_db:
+                cpu_vals = [s["cpu_pct"] for s in w_db]
+                mem_vals = [s["mem_pct"] for s in w_db]
+                w["db_stats"] = {
+                    "samples": len(w_db),
+                    "cpu_pct": {
+                        "avg": round(sum(cpu_vals) / len(cpu_vals), 2),
+                        "max": round(max(cpu_vals), 2),
+                    },
+                    "mem_pct": {
+                        "avg": round(sum(mem_vals) / len(mem_vals), 2),
+                        "max": round(max(mem_vals), 2),
+                    },
+                }
+
+            # Buffer stats in this window
+            w_buf = [s for s in buffer_samples if w_start <= s["ts"] < w_end]
+            if w_buf and configured_bytes:
+                buf_bytes = [s["total_bytes"] for s in w_buf]
+                avg_b = round(sum(buf_bytes) / len(buf_bytes))
+                max_b = max(buf_bytes)
+                w["shared_buffers"] = {
+                    "samples": len(w_buf),
+                    "bytes": {"avg": avg_b, "max": max_b},
+                    "utilization_pct": {
+                        "avg": round(avg_b / configured_bytes * 100, 2),
+                        "max": round(max_b / configured_bytes * 100, 2),
+                    },
+                }
+
+            output.append(w)
+        return output
+    else:
+        return [stats]
 
 
 def execute(args: argparse.Namespace):
@@ -96,16 +265,32 @@ def execute(args: argparse.Namespace):
 
     # Pre-generate query embeddings
     pool_size = min(total_queries, 50000)
-    print(f"Loading BGE model and pre-generating {pool_size} query embedding(s)...")
-    model = SentenceTransformer('BAAI/bge-large-en-v1.5')
+    input_dataset = _synthesize_dataset(pool_size)
 
-    if args.query_text:
-        texts = [args.query_text] * pool_size
-    else:
-        texts = [generate_random_text() for _ in range(pool_size)]
+    # Compute ground truth if reference dataset provided
+    ground_truth: Optional[dict[str, list[str]]] = None
+    if args.reference:
+        import h5py
 
-    embeddings = model.encode(texts, convert_to_numpy=True, batch_size=32)
-    vector_strs = ['[' + ','.join(map(str, emb)) + ']' for emb in embeddings]
+        print(f"Calculating ground truth from reference dataset {args.reference}")
+        with h5py.File(args.reference, "r") as f:
+            ref_embeddings = f["embeddings"][:]
+            ref_texts = f["texts"][:].astype(str)
+
+        query_vectors = np.stack([e.raw for e in input_dataset])
+
+        # pgvector <#> is negative inner product: -(a · b), smaller = more similar
+        distances = -np.inner(query_vectors, ref_embeddings)
+
+        top_n_indices = np.argsort(distances, axis=1)[:, : args.neighbors]
+
+        ground_truth = {
+            e.text: [ref_texts[idx] for idx in indices]
+            for e, indices in zip(input_dataset, top_n_indices)
+        }
+        print(
+            f"Computed ground truth for {len(ground_truth)} queries, top {args.neighbors} neighbors each"
+        )
 
     # Start monitoring threads
     stop_event = threading.Event()
@@ -127,16 +312,13 @@ def execute(args: argparse.Namespace):
     )
     buffer_thread.start()
 
-    # Wait for at least one docker sample
-    deadline = time.monotonic() + 15
-    while not db_samples and time.monotonic() < deadline:
-        time.sleep(0.1)
-
     # Run queries at target QPS
     timeout_ms = args.timeout * 1000
-    print(f"Running {args.qps} QPS for {args.period} ({duration_s}s), timeout={args.timeout}s...")
-    query_results = []  # [(relative_submit_time, latency, rows), ...]
-    error_times = []  # [relative_submit_time, ...]
+    print(
+        f"Running {args.qps} QPS for {args.period} ({duration_s}s), timeout={args.timeout}s..."
+    )
+    query_results: List[WindowResult] = []
+    error_times: List[float] = []  # [relative_submit_time, ...]
     max_workers = max(args.qps * 2, 4)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -150,19 +332,33 @@ def execute(args: argparse.Namespace):
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-            vec = vector_strs[query_num % len(vector_strs)]
+            query_input = input_dataset[query_num % len(input_dataset)]
+            expected = ground_truth.get(query_input.text) if ground_truth else None
             rel_time = time.monotonic() - start
-            futures.append((rel_time, pool.submit(
-                _run_single_query, conninfo, args.table, args.neighbors, vec, timeout_ms
-            )))
+            futures.append(
+                (
+                    rel_time,
+                    pool.submit(
+                        _run_single_query,
+                        conninfo,
+                        args.table,
+                        args.neighbors,
+                        query_input.vector,
+                        timeout_ms,
+                        expected,
+                    ),
+                )
+            )
             query_num += 1
 
         # Collect results
         for rel_time, f in futures:
             try:
                 result = f.result(timeout=30)
-                query_results.append((rel_time, result.latency, result.rows))
-            except Exception:
+                query_results.append(WindowResult(rel_time, result))
+            except Exception as e:
+                if not error_times:
+                    print(f"First query error: {e}")
                 error_times.append(rel_time)
 
     elapsed = time.monotonic() - start
@@ -172,135 +368,64 @@ def execute(args: argparse.Namespace):
     docker_thread.join()
     buffer_thread.join()
 
-    # Aggregate stats
-    latencies = [lat for _, lat, _ in query_results]
-    errors = len(error_times)
-    stats = {
-        'qps_target': args.qps,
-        'qps_actual': round(len(latencies) / elapsed, 2) if elapsed > 0 else 0,
-        'period': args.period,
-        'duration_s': round(elapsed, 2),
-        'total_queries': len(latencies),
-        'errors': errors,
-        'neighbors': args.neighbors,
-        'table': args.table,
-    }
-
-    if latencies:
-        stats['latency_s'] = _latency_stats(latencies)
-
-    stats.update(summarize_stats(db_samples, buffer_samples, args.container, conninfo))
-
-    if window_s:
-        num_windows = math.ceil(elapsed / window_s)
-        configured_bytes = stats.get('shared_buffers', {}).get('configured_bytes')
-
-        for i in range(num_windows):
-            w_start = i * window_s
-            w_end = (i + 1) * window_s
-            w = {
-                'window': i,
-                'window_s': window_s,
-                'start_s': round(w_start, 2),
-                'end_s': round(min(w_end, elapsed), 2),
-                'qps_target': args.qps,
-                'period': args.period,
-                'duration_s': round(elapsed, 2),
-                'neighbors': args.neighbors,
-                'table': args.table,
-            }
-
-            # Query latencies in this window
-            w_lats = [lat for t, lat, _ in query_results if w_start <= t < w_end]
-            w['queries'] = len(w_lats)
-            if w_lats:
-                actual_duration = min(w_end, elapsed) - w_start
-                w['qps_actual'] = round(len(w_lats) / actual_duration, 2) if actual_duration > 0 else 0
-                w['latency_s'] = _latency_stats(w_lats)
-
-            # Docker stats in this window
-            w_db = [s for s in db_samples if w_start <= s['ts'] < w_end]
-            if w_db:
-                cpu_vals = [s['cpu_pct'] for s in w_db]
-                mem_vals = [s['mem_pct'] for s in w_db]
-                w['db_stats'] = {
-                    'samples': len(w_db),
-                    'cpu_pct': {'avg': round(sum(cpu_vals)/len(cpu_vals), 2), 'max': round(max(cpu_vals), 2)},
-                    'mem_pct': {'avg': round(sum(mem_vals)/len(mem_vals), 2), 'max': round(max(mem_vals), 2)},
-                }
-
-            # Buffer stats in this window
-            w_buf = [s for s in buffer_samples if w_start <= s['ts'] < w_end]
-            if w_buf and configured_bytes:
-                buf_bytes = [s['total_bytes'] for s in w_buf]
-                avg_b = round(sum(buf_bytes) / len(buf_bytes))
-                max_b = max(buf_bytes)
-                w['shared_buffers'] = {
-                    'samples': len(w_buf),
-                    'bytes': {'avg': avg_b, 'max': max_b},
-                    'utilization_pct': {
-                        'avg': round(avg_b / configured_bytes * 100, 2),
-                        'max': round(max_b / configured_bytes * 100, 2),
-                    },
-                }
-
-            print(json.dumps(w))
-            if args.stats_file:
-                write_stats(w, args.stats_file)
-    else:
-        print(json.dumps(stats, indent=2))
+    # Aggregate / dump stats
+    for datapoint in _generate_stats(
+        args,
+        query_results,
+        db_samples,
+        buffer_samples,
+        conninfo,
+        error_times,
+        window_s,
+        elapsed,
+    ):
+        print(json.dumps(datapoint))
         if args.stats_file:
-            write_stats(stats, args.stats_file)
+            write_stats(datapoint, args.stats_file)
 
 
 def register_query_command(subparsers: SubParsersAction) -> None:
     """Register the query subcommand."""
     parser = subparsers.add_parser(
-        'query',
-        help='Query nearest neighbors with load testing and monitoring'
+        "query", help="Query nearest neighbors with load testing and monitoring"
     )
     add_common_args(parser)
 
     parser.add_argument(
-        '-n', '--neighbors',
+        "-n",
+        "--neighbors",
         type=int,
         default=10,
-        help='Number of nearest neighbors per query (default: 10)'
+        help="Number of nearest neighbors per query (default: 10)",
     )
     parser.add_argument(
-        '--qps',
-        type=int,
-        default=1,
-        help='Target queries per second (default: 1)'
+        "--qps", type=int, default=1, help="Target queries per second (default: 1)"
     )
     parser.add_argument(
-        '--period',
+        "--period",
         type=str,
-        default='1s',
-        help='Duration to run, e.g. 30s, 5m, 2h (default: 1s)'
+        default="1s",
+        help="Duration to run, e.g. 30s, 5m, 2h (default: 1s)",
     )
     parser.add_argument(
-        '--window',
+        "--window",
         type=str,
         default=None,
-        help='Stats window size, e.g. 15s, 1m (buckets stats into time windows)'
+        help="Stats window size, e.g. 15s, 1m (buckets stats into time windows)",
     )
     parser.add_argument(
-        '--query-text',
-        type=str,
-        default=None,
-        help='Query text (default: generate random text per query)'
-    )
-    parser.add_argument(
-        '--timeout',
+        "--timeout",
         type=float,
         default=1.0,
-        help='Query statement timeout in seconds (default: 1)'
+        help="Query statement timeout in seconds (default: 1)",
     )
     parser.add_argument(
-        '--seed',
-        type=int,
+        "--reference",
+        type=str,
         default=None,
-        help='Random seed for text generation'
+        help="Path to an HDF5 file containing reference embeddings",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None, help="Random seed for text generation"
     )
     parser.set_defaults(func=execute)
