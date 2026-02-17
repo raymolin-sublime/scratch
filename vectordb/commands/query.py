@@ -142,6 +142,24 @@ def _synthesize_dataset(size: int) -> List[Embedding]:
     ]
 
 
+def _load_dataset(path: str, num_samples: Optional[int] = None) -> List[Embedding]:
+    import h5py
+
+    with h5py.File(path, "r") as f:
+        available = int(f.attrs["num_vectors"])
+        n = min(num_samples, available) if num_samples is not None else available
+        print(f"Loading {n} embeddings from {path} ({available} available)...")
+        embeddings = f["embeddings"][:n]
+        texts = f["texts"][:n].astype(str)
+
+    vectors = ["[" + ",".join(map(str, emb)) + "]" for emb in embeddings]
+
+    return [
+        Embedding(text, vector, emb)
+        for text, vector, emb in zip(texts, vectors, embeddings)
+    ]
+
+
 def _generate_stats(
     args: argparse.Namespace,
     results: List[WindowResult],
@@ -264,8 +282,11 @@ def execute(args: argparse.Namespace):
     conninfo = build_conninfo(args)
 
     # Pre-generate query embeddings
-    pool_size = min(total_queries, 10000)
-    input_dataset = _synthesize_dataset(pool_size)
+    if args.input:
+        input_dataset = _load_dataset(args.input, args.samples)
+    else:
+        pool_size = min(total_queries, 10000)
+        input_dataset = _synthesize_dataset(pool_size)
 
     # Compute ground truth if reference dataset provided
     ground_truth: Optional[dict[str, list[str]]] = None
@@ -279,8 +300,11 @@ def execute(args: argparse.Namespace):
 
         query_vectors = np.stack([e.raw for e in input_dataset])
 
-        # pgvector <#> is negative inner product: -(a · b), smaller = more similar
-        distances = -np.inner(query_vectors, ref_embeddings)
+        # pgvector <=> is cosine distance: 1 - cos(a, b), smaller = more similar
+        query_norms = np.linalg.norm(query_vectors, axis=1, keepdims=True)
+        ref_norms = np.linalg.norm(ref_embeddings, axis=1, keepdims=True)
+        cosine_sim = np.inner(query_vectors / query_norms, (ref_embeddings / ref_norms))
+        distances = 1 - cosine_sim
 
         top_n_indices = np.argsort(distances, axis=1)[:, : args.neighbors]
 
@@ -418,6 +442,18 @@ def register_query_command(subparsers: SubParsersAction) -> None:
         type=float,
         default=1.0,
         help="Query statement timeout in seconds (default: 1)",
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=None,
+        help="Path to an HDF5 file to use as the query dataset instead of synthesizing",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=None,
+        help="Number of samples to use from the --input HDF5 file (defaults to all)",
     )
     parser.add_argument(
         "--reference",
