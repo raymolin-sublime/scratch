@@ -142,17 +142,17 @@ def add_common_args(parser):
     parser.add_argument(
         "--database",
         type=str,
-        default="postgres",
-        help="Database name (default: postgres)",
+        default="test",
+        help="Database name (default: test)",
     )
     parser.add_argument(
-        "--user", type=str, default="postgres", help="Database user (default: postgres)"
+        "--user", type=str, default="raymolin", help="Database user (default: raymolin)"
     )
     parser.add_argument(
         "--password",
         type=str,
-        default="postgres",
-        help="Database password (default: postgres)",
+        default="secret",
+        help="Database password (default: secret)",
     )
     parser.add_argument(
         "--table",

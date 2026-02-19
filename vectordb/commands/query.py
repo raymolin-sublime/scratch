@@ -88,13 +88,16 @@ def _run_single_query(
     vector_str: str,
     timeout_ms: float,
     expected_neighbors: Optional[List[str]] = None,
+    ef_search: Optional[int] = None,
 ) -> QueryResult:
     """Run a single nearest-neighbor query. Returns (latency, rows, recall)."""
     if not hasattr(_thread_local, "conn") or _thread_local.conn.closed:
         _thread_local.conn = psycopg.connect(conninfo, autocommit=True)
-        if timeout_ms:
-            with _thread_local.conn.cursor() as cur:
+        with _thread_local.conn.cursor() as cur:
+            if timeout_ms:
                 cur.execute(f"SET statement_timeout = {int(timeout_ms)}")
+            if ef_search is not None:
+                cur.execute(f"SET hnsw.ef_search = {int(ef_search)}")
     conn = _thread_local.conn
 
     t0 = time.perf_counter()
@@ -181,6 +184,7 @@ def _generate_stats(
         "errors": errors,
         "neighbors": args.neighbors,
         "table": args.table,
+        "ef_search": args.ef_search if args.ef_search is not None else 40,
     }
 
     if latencies:
@@ -210,6 +214,7 @@ def _generate_stats(
                 "duration_s": round(elapsed, 2),
                 "neighbors": args.neighbors,
                 "table": args.table,
+                "ef_search": args.ef_search if args.ef_search is not None else 40,
             }
 
             # Query latencies in this window
@@ -370,6 +375,7 @@ def execute(args: argparse.Namespace):
                         query_input.vector,
                         timeout_ms,
                         expected,
+                        args.ef_search,
                     ),
                 )
             )
@@ -392,6 +398,14 @@ def execute(args: argparse.Namespace):
     docker_thread.join()
     buffer_thread.join()
 
+    # Parse extra metadata
+    meta = {}
+    for item in args.meta:
+        key, _, value = item.partition(":")
+        if not _:
+            raise ValueError(f"Invalid --meta format: {item!r} (expected key:value)")
+        meta[key] = value
+
     # Aggregate / dump stats
     for datapoint in _generate_stats(
         args,
@@ -403,6 +417,7 @@ def execute(args: argparse.Namespace):
         window_s,
         elapsed,
     ):
+        datapoint.update(meta)
         print(json.dumps(datapoint))
         if args.stats_file:
             write_stats(datapoint, args.stats_file)
@@ -462,6 +477,19 @@ def register_query_command(subparsers: SubParsersAction) -> None:
         help="Path to an HDF5 file containing reference embeddings",
     )
     parser.add_argument(
+        "--ef-search",
+        type=int,
+        default=None,
+        help="HNSW ef_search parameter (default: pgvector default)",
+    )
+    parser.add_argument(
         "--seed", type=int, default=None, help="Random seed for text generation"
+    )
+    parser.add_argument(
+        "--meta",
+        type=str,
+        action="append",
+        default=[],
+        help="Extra metadata as key:value (repeatable, e.g. --meta m:16 --meta ef_construction:64)",
     )
     parser.set_defaults(func=execute)

@@ -165,11 +165,20 @@ def execute(args):
 
             # Create index if requested
             if args.create_index:
+                with_opts = []
+                if args.m is not None:
+                    with_opts.append(f"m = {args.m}")
+                if args.ef_construction is not None:
+                    with_opts.append(f"ef_construction = {args.ef_construction}")
+                with_clause = (
+                    f" WITH ({', '.join(with_opts)})" if with_opts else ""
+                )
+
                 print("Creating HNSW index...")
                 t0 = time.perf_counter()
                 cur.execute(f"""
                     CREATE INDEX ON {args.table}
-                    USING hnsw (embedding vector_cosine_ops)
+                    USING hnsw (embedding vector_cosine_ops){with_clause}
                 """)
                 conn.commit()
                 index_elapsed = time.perf_counter() - t0
@@ -208,6 +217,10 @@ def execute(args):
 
     if args.create_index:
         stats["index_creation_time_s"] = round(index_elapsed, 3)
+        if args.m is not None:
+            stats["m"] = args.m
+        if args.ef_construction is not None:
+            stats["ef_construction"] = args.ef_construction
 
     stats.update(summarize_stats(db_samples, buffer_samples, args.container, conninfo))
 
@@ -251,5 +264,17 @@ def register_load_command(subparsers):
         type=str,
         default=None,
         help="Set maintenance_work_mem for index creation (e.g. 1GB, 512MB)",
+    )
+    parser.add_argument(
+        "--m",
+        type=int,
+        default=None,
+        help="HNSW m parameter: max connections per node (default: 16)",
+    )
+    parser.add_argument(
+        "--ef-construction",
+        type=int,
+        default=None,
+        help="HNSW ef_construction parameter: size of dynamic candidate list during index build (default: 64)",
     )
     parser.set_defaults(func=execute)
