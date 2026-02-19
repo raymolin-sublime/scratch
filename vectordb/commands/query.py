@@ -305,18 +305,22 @@ def execute(args: argparse.Namespace):
 
         query_vectors = np.stack([e.raw for e in input_dataset])
 
-        # pgvector <=> is cosine distance: 1 - cos(a, b), smaller = more similar
-        query_norms = np.linalg.norm(query_vectors, axis=1, keepdims=True)
-        ref_norms = np.linalg.norm(ref_embeddings, axis=1, keepdims=True)
-        cosine_sim = np.inner(query_vectors / query_norms, (ref_embeddings / ref_norms))
-        distances = 1 - cosine_sim
+        # Normalize as float32 to avoid silent upcast to float64 from np.linalg.norm
+        query_vectors = query_vectors / np.linalg.norm(query_vectors, axis=1, keepdims=True).astype(np.float32)
+        ref_embeddings = ref_embeddings / np.linalg.norm(ref_embeddings, axis=1, keepdims=True).astype(np.float32)
 
-        top_n_indices = np.argsort(distances, axis=1)[:, : args.neighbors]
-
-        ground_truth = {
-            e.text: [ref_texts[idx] for idx in indices]
-            for e, indices in zip(input_dataset, top_n_indices)
-        }
+        # Chunk queries to bound peak memory. Each chunk allocates:
+        #   cosine_sim: chunk_size × num_ref × 4 bytes (float32)
+        #   argpartition: chunk_size × num_ref × 8 bytes (int64)
+        # Target ~500MB per chunk for the cosine_sim matrix.
+        chunk_size = max(1, (500 * 1024 * 1024) // (ref_embeddings.shape[0] * 4))
+        ground_truth = {}
+        for i in range(0, len(query_vectors), chunk_size):
+            chunk = query_vectors[i : i + chunk_size]
+            cosine_sim = np.inner(chunk, ref_embeddings)
+            top_n_indices = np.argpartition(-cosine_sim, args.neighbors, axis=1)[:, : args.neighbors]
+            for j, indices in enumerate(top_n_indices):
+                ground_truth[input_dataset[i + j].text] = [ref_texts[idx] for idx in indices]
         print(
             f"Computed ground truth for {len(ground_truth)} queries, top {args.neighbors} neighbors each"
         )
