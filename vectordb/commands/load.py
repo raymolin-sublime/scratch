@@ -49,18 +49,24 @@ def execute(args):
         total_vectors = int(f.attrs["num_vectors"])
         embedding_dim = int(f.attrs["embedding_dim"])
 
+        offset = args.offset or 0
+        remaining = total_vectors - offset
+        if remaining <= 0:
+            print(f"Offset {offset} is beyond dataset size {total_vectors}")
+            return
+
         num_vectors = (
-            min(args.num_vectors, total_vectors)
+            min(args.num_vectors, remaining)
             if args.num_vectors is not None
-            else total_vectors
+            else remaining
         )
 
-        embeddings = f["embeddings"][:num_vectors]
-        texts = f["texts"][:num_vectors].astype(str)
+        embeddings = f["embeddings"][offset : offset + num_vectors]
+        texts = f["texts"][offset : offset + num_vectors].astype(str)
 
-    if args.num_vectors is not None and args.num_vectors > total_vectors:
+    if args.num_vectors is not None and args.num_vectors > remaining:
         print(
-            f"Requested {args.num_vectors} vectors but file only contains {total_vectors}, loading all"
+            f"Requested {args.num_vectors} vectors but only {remaining} available from offset {offset}, loading all"
         )
 
     print(
@@ -247,6 +253,12 @@ def register_load_command(subparsers):
         type=int,
         default=None,
         help="Number of vectors to load from the HDF5 file (default: all)",
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=None,
+        help="Starting index in the HDF5 dataset (default: 0)",
     )
     parser.add_argument(
         "--create-table", action="store_true", help="Create table if it does not exist"

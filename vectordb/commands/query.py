@@ -145,15 +145,18 @@ def _synthesize_dataset(size: int) -> List[Embedding]:
     ]
 
 
-def _load_dataset(path: str, num_samples: Optional[int] = None) -> List[Embedding]:
+def _load_dataset(path: str, num_samples: Optional[int] = None, offset: int = 0) -> List[Embedding]:
     import h5py
 
     with h5py.File(path, "r") as f:
         available = int(f.attrs["num_vectors"])
-        n = min(num_samples, available) if num_samples is not None else available
-        print(f"Loading {n} embeddings from {path} ({available} available)...")
-        embeddings = f["embeddings"][:n]
-        texts = f["texts"][:n].astype(str)
+        remaining = available - offset
+        if remaining <= 0:
+            raise ValueError(f"Offset {offset} is beyond dataset size {available}")
+        n = min(num_samples, remaining) if num_samples is not None else remaining
+        print(f"Loading {n} embeddings from {path} (offset={offset}, {available} total)...")
+        embeddings = f["embeddings"][offset : offset + n]
+        texts = f["texts"][offset : offset + n].astype(str)
 
     vectors = ["[" + ",".join(map(str, emb)) + "]" for emb in embeddings]
 
@@ -288,7 +291,7 @@ def execute(args: argparse.Namespace):
 
     # Pre-generate query embeddings
     if args.input:
-        input_dataset = _load_dataset(args.input, args.samples)
+        input_dataset = _load_dataset(args.input, args.samples, args.offset or 0)
     else:
         pool_size = min(total_queries, 10000)
         input_dataset = _synthesize_dataset(pool_size)
@@ -473,6 +476,12 @@ def register_query_command(subparsers: SubParsersAction) -> None:
         type=int,
         default=None,
         help="Number of samples to use from the --input HDF5 file (defaults to all)",
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=None,
+        help="Starting index in the --input HDF5 dataset (default: 0)",
     )
     parser.add_argument(
         "--reference",

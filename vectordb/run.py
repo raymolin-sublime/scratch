@@ -6,6 +6,7 @@ Vector embedding CLI tool with generate, load, and query functionality.
 import argparse
 
 from commands import (
+    register_degrade_command,
     register_generate_command,
     register_load_command,
     register_plot_command,
@@ -23,6 +24,7 @@ def main():
     subparsers.required = True
 
     # Register subcommands
+    register_degrade_command(subparsers)
     register_generate_command(subparsers)
     register_load_command(subparsers)
     register_plot_command(subparsers)
