@@ -145,6 +145,22 @@ def _synthesize_dataset(size: int) -> List[Embedding]:
     ]
 
 
+def _load_reference_from_table(conninfo: str, table: str):
+    """Fetch all texts and embeddings from the table for ground truth computation."""
+    with psycopg.connect(conninfo) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT text, embedding::text FROM {table}")
+            rows = cur.fetchall()
+
+    texts = np.array([r[0] for r in rows], dtype=str)
+    embeddings = np.array(
+        [[float(x) for x in r[1].strip("[]").split(",")] for r in rows],
+        dtype=np.float32,
+    )
+    print(f"Loaded {len(rows)} vectors from table {table}")
+    return texts, embeddings
+
+
 def _load_dataset(path: str, num_samples: Optional[int] = None, offset: int = 0) -> List[Embedding]:
     import h5py
 
@@ -298,13 +314,17 @@ def execute(args: argparse.Namespace):
 
     # Compute ground truth if reference dataset provided
     ground_truth: Optional[dict[str, list[str]]] = None
-    if args.reference:
-        import h5py
+    if args.reference or args.reference_from_table:
+        if args.reference_from_table:
+            print(f"Calculating ground truth from table {args.table}")
+            ref_texts, ref_embeddings = _load_reference_from_table(conninfo, args.table)
+        else:
+            import h5py
 
-        print(f"Calculating ground truth from reference dataset {args.reference}")
-        with h5py.File(args.reference, "r") as f:
-            ref_embeddings = f["embeddings"][:]
-            ref_texts = f["texts"][:].astype(str)
+            print(f"Calculating ground truth from reference dataset {args.reference}")
+            with h5py.File(args.reference, "r") as f:
+                ref_embeddings = f["embeddings"][:]
+                ref_texts = f["texts"][:].astype(str)
 
         query_vectors = np.stack([e.raw for e in input_dataset])
 
@@ -488,6 +508,11 @@ def register_query_command(subparsers: SubParsersAction) -> None:
         type=str,
         default=None,
         help="Path to an HDF5 file containing reference embeddings",
+    )
+    parser.add_argument(
+        "--reference-from-table",
+        action="store_true",
+        help="Compute ground truth from vectors currently in the table (reflects deletions)",
     )
     parser.add_argument(
         "--ef-search",

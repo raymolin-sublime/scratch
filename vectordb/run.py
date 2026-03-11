@@ -11,6 +11,7 @@ from commands import (
     register_load_command,
     register_plot_command,
     register_query_command,
+    register_reindex_command,
 )
 
 
@@ -29,6 +30,7 @@ def main():
     register_load_command(subparsers)
     register_plot_command(subparsers)
     register_query_command(subparsers)
+    register_reindex_command(subparsers)
 
     # Parse and execute
     args = parser.parse_args()
